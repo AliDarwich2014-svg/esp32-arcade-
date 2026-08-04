@@ -1,0 +1,1724 @@
+#include <LovyanGFX.hpp>
+#include <SPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <Preferences.h>
+
+// ==========================================
+// 1. HARDWARE CONFIG & PINS
+// ==========================================
+#define TFT_MOSI  11
+#define TFT_MISO  13
+#define TFT_SCK   12
+#define TFT_CS    10
+#define TFT_DC     8
+#define TFT_RST    9
+#define TOUCH_CS  14
+#define TOUCH_IRQ  7
+#define BUZZER_PIN 4
+
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ILI9341 panel;
+  lgfx::Bus_SPI bus;
+public:
+  LGFX() {
+    auto cfg = bus.config();
+    cfg.spi_host = SPI2_HOST;
+    cfg.spi_mode = 0;
+    cfg.freq_write = 40000000;
+    cfg.pin_sclk = TFT_SCK;
+    cfg.pin_mosi = TFT_MOSI;
+    cfg.pin_miso = TFT_MISO;
+    cfg.pin_dc   = TFT_DC;
+    bus.config(cfg);
+    panel.setBus(&bus);
+
+    auto p = panel.config();
+    p.pin_cs       = TFT_CS;
+    p.pin_rst      = TFT_RST;
+    p.panel_width  = 320;
+    p.panel_height = 240;
+    p.memory_width  = 320;
+    p.memory_height = 240;
+    p.offset_rotation = 1;
+    panel.config(p);
+    setPanel(&panel);
+  }
+};
+
+LGFX tft;
+LGFX_Sprite canvas(&tft);
+XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
+Preferences prefs;
+
+// Game States
+enum GameState { MENU, SETTINGS, WHACK_MOLE, WHACK_GAME_OVER, PIZZA_HERO, PIZZA_PAUSE, PIZZA_UPGRADE_WARNING, PIZZA_UPGRADE, PIZZA_GAME_OVER };
+GameState currentGameState = MENU;
+
+bool touchPressed = false;
+int touchX = 0, touchY = 0;
+bool lastTouchState = false;
+
+int highScoreWhack = 0;
+int highScorePizza = 0;
+int soundVolume = 5;
+
+void loadPreferences() {
+  prefs.begin("arcade", true);
+  highScoreWhack = prefs.getInt("hswhack", 0);
+  highScorePizza = prefs.getInt("hspizza", 0);
+  soundVolume = prefs.getInt("vol", 5);
+  prefs.end();
+}
+
+void saveHighScore(String game, int score) {
+  prefs.begin("arcade", false);
+  if (game == "whack" && score > highScoreWhack) {
+    highScoreWhack = score;
+    prefs.putInt("hswhack", highScoreWhack);
+  } else if (game == "pizza" && score > highScorePizza) {
+    highScorePizza = score;
+    prefs.putInt("hspizza", highScorePizza);
+  }
+  prefs.end();
+}
+
+void saveVolumeSetting() {
+  prefs.begin("arcade", false);
+  prefs.putInt("vol", soundVolume);
+  prefs.end();
+}
+
+void resetHighScores() {
+  prefs.begin("arcade", false);
+  prefs.clear();
+  prefs.end();
+  highScoreWhack = 0;
+  highScorePizza = 0;
+  soundVolume = 5;
+}
+
+void playTone(int freq, int duration) {
+  if (soundVolume <= 0) return;
+  tone(BUZZER_PIN, freq, duration);
+}
+
+void updateTouch() {
+  if (touch.touched()) {
+    TS_Point pt = touch.getPoint();
+    touchX = map(pt.x, 200, 3800, 0, 320);
+    touchY = map(pt.y, 200, 3800, 0, 240);
+    touchX = constrain(touchX, 0, 320);
+    touchY = constrain(touchY, 0, 240);
+    touchPressed = true;
+  } else {
+    touchPressed = false;
+  }
+}
+
+// ==========================================
+// 2. GAME: WHACK-A-MOLE
+// ==========================================
+int moleState[6]; 
+unsigned long moleTimer = 0;
+unsigned long actionTimer = 0;
+int moleScore = 0;
+int lives = 3;
+int animFrame = 0;
+
+void initWhack() {
+  moleScore = 0;
+  lives = 3;
+  moleTimer = millis();
+  for(int i=0; i<6; i++) moleState[i] = 0;
+  moleState[random(0, 6)] = 1;
+}
+
+void drawMole(int x, int y, int frame) {
+  int bobY = y + (frame % 2 == 0 ? -2 : 2);
+  canvas.fillCircle(x, bobY, 22, TFT_BROWN);
+  canvas.fillCircle(x - 7, bobY - 5, 3, TFT_BLACK);
+  canvas.fillCircle(x + 7, bobY - 5, 3, TFT_BLACK);
+  canvas.fillEllipse(x, bobY + 4, 6, 4, TFT_LIGHTGREY);
+  canvas.fillCircle(x, bobY + 3, 2, TFT_BLACK);
+  canvas.drawLine(x - 14, bobY + 2, x - 8, bobY + 4, TFT_BLACK);
+  canvas.drawLine(x - 14, bobY + 6, x - 8, bobY + 5, TFT_BLACK);
+  canvas.drawLine(x + 8, bobY + 4, x + 14, bobY + 2, TFT_BLACK);
+  canvas.drawLine(x + 8, bobY + 5, x + 14, bobY + 6, TFT_BLACK);
+}
+
+void drawBomb(int x, int y) {
+  canvas.fillCircle(x, y + 2, 20, TFT_DARKGREY);
+  canvas.fillRect(x - 3, y - 20, 6, 8, TFT_ORANGE);
+  canvas.drawLine(x, y - 20, x + 8, y - 25, TFT_YELLOW);
+  canvas.setTextSize(1);
+  canvas.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  canvas.setCursor(x - 6, y - 4);
+  canvas.print("X");
+}
+
+void drawExplosion(int x, int y) {
+  canvas.fillCircle(x, y, random(15, 28), TFT_RED);
+  canvas.fillCircle(x, y, random(8, 16), TFT_ORANGE);
+  canvas.fillCircle(x, y, random(3, 8), TFT_YELLOW);
+}
+
+void runWhack() {
+  canvas.fillScreen(TFT_BLACK);
+  canvas.setTextSize(1);
+  canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  canvas.setCursor(10, 10); canvas.print("SCORE:"); canvas.print(moleScore);
+  canvas.setCursor(90, 10); canvas.print("LIVES:"); canvas.print(lives);
+  canvas.setCursor(180, 10); canvas.print("HS:"); canvas.print(highScoreWhack);
+  canvas.setCursor(270, 10); canvas.print("EXIT");
+
+  int coords[6][2] = {{60, 70}, {160, 70}, {260, 70}, {60, 150}, {160, 150}, {260, 150}};
+  
+  bool hasActiveAnimation = false;
+  for(int i=0; i<6; i++) {
+    if(moleState[i] == 3 || moleState[i] == 4) {
+      hasActiveAnimation = true;
+      break;
+    }
+  }
+  if (hasActiveAnimation && millis() - actionTimer > 300) {
+    for(int i=0; i<6; i++) { 
+      if(moleState[i] == 3 || moleState[i] == 4) moleState[i] = 0; 
+    }
+  }
+
+  for(int i = 0; i < 6; i++) {
+    canvas.drawCircle(coords[i][0], coords[i][1], 30, TFT_BLUE);
+    if(moleState[i] == 1) drawMole(coords[i][0], coords[i][1], animFrame);
+    else if(moleState[i] == 2) drawBomb(coords[i][0], coords[i][1]);
+    else if(moleState[i] == 3) drawExplosion(coords[i][0], coords[i][1]);
+    else if(moleState[i] == 4) {
+      canvas.fillCircle(coords[i][0], coords[i][1] + 8, 14, TFT_BROWN);
+      canvas.setTextSize(1);
+      canvas.setTextColor(TFT_WHITE, TFT_RED);
+      canvas.setCursor(coords[i][0] - 12, coords[i][1] - 20);
+      canvas.print("POW!");
+    }
+  }
+
+  if (touchPressed && !lastTouchState) {
+    if (touchY < 30 && touchX > 250) { currentGameState = MENU; delay(300); return; }
+    for(int i = 0; i < 6; i++) {
+      int dx = touchX - coords[i][0];
+      int dy = touchY - coords[i][1];
+      if(dx * dx + dy * dy < 900) {
+        if(moleState[i] == 1) {
+          moleScore += 10;
+          saveHighScore("whack", moleScore);
+          moleState[i] = 4;
+          actionTimer = millis();
+          playTone(600, 50);
+        } else if(moleState[i] == 2) {
+          lives--;
+          moleState[i] = 3;
+          actionTimer = millis();
+          playTone(150, 100);
+          if(lives <= 0) {
+            currentGameState = WHACK_GAME_OVER;
+            delay(300);
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  int activeTime = max(500, (int)(1000 - (moleScore * 0.8))); 
+  int bombChance = min(40, 15 + (moleScore / 20)); 
+
+  if(millis() - moleTimer > activeTime) {
+    for(int i=0; i<6; i++) { if(moleState[i] != 3 && moleState[i] != 4) moleState[i] = 0; }
+    int target = random(0, 6);
+    moleState[target] = (random(0, 100) < bombChance) ? 2 : 1;
+    moleTimer = millis();
+    animFrame++;
+  }
+}
+
+void runWhackGameOver() {
+  canvas.fillScreen(TFT_BLACK);
+  canvas.setTextSize(2);
+  canvas.setTextColor(TFT_RED, TFT_BLACK);
+  canvas.setCursor(80, 40); canvas.print("GAME OVER");
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  canvas.setCursor(90, 90); canvas.print("Final Score: "); canvas.print(moleScore);
+  canvas.setCursor(90, 115); canvas.print("High Score:  "); canvas.print(highScoreWhack);
+
+  canvas.fillRoundRect(80, 155, 160, 40, 6, TFT_MAROON);
+  canvas.setTextColor(TFT_WHITE, TFT_MAROON);
+  canvas.setCursor(120, 168); canvas.print("MAIN MENU");
+
+  canvas.pushSprite(0, 0);
+
+  if (touchPressed && !lastTouchState) {
+    if (touchX >= 80 && touchX <= 240 && touchY >= 155 && touchY <= 195) {
+      currentGameState = MENU;
+      delay(300);
+    }
+  }
+}
+
+// ==========================================
+// 3. GAME: PIZZA HERO ROGUELIKE
+// ==========================================
+float pizzaX = 160, pizzaY = 120;
+int pizzaHP = 100;
+int pizzaMaxHP = 100;
+int pizzaXP = 0;
+int pizzaLevel = 1;
+int nextLevelXP = 50;
+int pizzaWave = 1;
+
+// Upgrades / Toppings (20 total)
+int upgPepperoni = 0; 
+int upgMushroom = 0;  
+int upgOlive = 0;     
+int upgBacon = 0;     
+int upgGarlic = 0;    
+int upgCheese = 0;    
+int upgCrust = 0;     
+int upgSausage = 0;   
+int upgBasil = 0;     
+int upgMagnet = 0;
+int upgKnifeSpin = 0; 
+int upgPineapple = 0;
+int upgOnion = 0;
+int upgJalapeno = 0;
+int upgTruffle = 0;
+int upgAnchovy = 0;
+int upgHoney = 0;
+int upgPotato = 0;
+int upgHotSauce = 0;
+int upgMarshmallow = 0;
+
+int currentRandomUpgrades[3] = {0, 0, 0};
+
+// Enemy Structure
+struct Enemy {
+  float x, y;
+  int hp;
+  int maxHp;
+  int type; // 0=Fork, 1=Knife, 2=Pizza Cutter, 3=Spoon, 4=Whisk, 5=Cookware Boss, 6=Salt Shaker (Ranged), 7=Rolling Pin (Ranged)
+  bool active;
+  unsigned long lastShot;
+};
+Enemy enemies[24];
+
+bool bossActive = false;
+bool megaBossActive = false;
+bool megaBossSpawnedThisRun = false; 
+
+// Mega Boss Structure
+struct MegaBoss {
+  float x, y;
+  int hp;
+  int maxHp;
+  bool active;
+  unsigned long attackCooldown;
+} megaBoss;
+
+unsigned long megaBossFireTick = 0;
+
+// Projectiles Structure
+struct Projectile {
+  float x, y;
+  float vx, vy;
+  int type; 
+  bool active;
+};
+Projectile projectiles[96];
+
+// Area Effect Visual Indicators struct
+struct AreaEffect {
+  float x, y;
+  float radius;
+  uint16_t color;
+  int duration; 
+  bool active;
+};
+AreaEffect areaEffects[16];
+
+// XP Gems & Magnet Item
+struct Gem {
+  float x, y;
+  int type; 
+  bool active;
+};
+Gem gems[32];
+
+struct MagnetItem {
+  float x, y;
+  bool active;
+};
+MagnetItem mapMagnet;
+
+bool magnetSpawnedOnce = false;
+unsigned long bossFireTick = 0;
+
+// Knife Spin Timers
+unsigned long knifeSpinActiveTimer = 0;
+unsigned long knifeSpinCooldownTimer = 0;
+bool knifeSpinIsActive = false;
+
+void initPizzaHero() {
+  pizzaX = 160; pizzaY = 120;
+  pizzaHP = 100; pizzaMaxHP = 100;
+  pizzaXP = 0; pizzaLevel = 1; nextLevelXP = 50; pizzaWave = 1;
+  upgPepperoni = 0; upgMushroom = 0; upgOlive = 0; upgBacon = 0; upgGarlic = 0; 
+  upgCheese = 0; upgCrust = 0; upgSausage = 0; upgBasil = 0; upgMagnet = 0; upgKnifeSpin = 0; 
+  upgPineapple = 0; upgOnion = 0; upgJalapeno = 0; upgTruffle = 0; upgAnchovy = 0; upgHoney = 0;
+  upgPotato = 0; upgHotSauce = 0; upgMarshmallow = 0;
+  bossActive = false;
+  megaBossActive = false;
+  megaBossSpawnedThisRun = false;
+  megaBoss.active = false;
+  magnetSpawnedOnce = false;
+  mapMagnet.active = false;
+  bossFireTick = millis();
+  megaBossFireTick = millis();
+  knifeSpinActiveTimer = 0;
+  knifeSpinCooldownTimer = millis();
+  knifeSpinIsActive = false;
+  
+  for(int i=0; i<24; i++) enemies[i].active = false;
+  for(int i=0; i<96; i++) projectiles[i].active = false;
+  for(int i=0; i<32; i++) gems[i].active = false;
+  for(int i=0; i<16; i++) areaEffects[i].active = false;
+}
+
+unsigned long lastShotTick = 0;
+unsigned long spawnTick = 0;
+
+void runPizzaGame() {
+  canvas.fillScreen(TFT_BLACK);
+
+  for(int x = 0; x < 320; x += 40) canvas.drawLine(x, 0, x, 240, lgfx::color565(30, 30, 45));
+  for(int y = 0; y < 240; y += 40) canvas.drawLine(0, y, 320, y, lgfx::color565(30, 30, 45));
+
+  // Render Persistent Area Effects with Outer Indicator Rings
+  for(int a=0; a<16; a++) {
+    if(areaEffects[a].active) {
+      canvas.drawCircle(areaEffects[a].x, areaEffects[a].y, areaEffects[a].radius, areaEffects[a].color);
+      canvas.drawCircle(areaEffects[a].x, areaEffects[a].y, areaEffects[a].radius + 2, TFT_WHITE);
+      canvas.drawCircle(areaEffects[a].x, areaEffects[a].y, areaEffects[a].radius - 1, areaEffects[a].color);
+      
+      areaEffects[a].duration--;
+      if(areaEffects[a].duration <= 0) {
+        areaEffects[a].active = false;
+      }
+    }
+  }
+
+  // Touch Movement
+  if (touchPressed) {
+    if (touchY < 25 && touchX > 270) {
+      if (!lastTouchState) {
+        currentGameState = PIZZA_PAUSE;
+        lastTouchState = true;
+        delay(200);
+        return;
+      }
+    } else {
+      float moveSpeed = 1.6 + (upgCrust * 0.4);
+      if (touchX < pizzaX) pizzaX -= moveSpeed;
+      if (touchX > pizzaX) pizzaX += moveSpeed;
+      if (touchY < pizzaY) pizzaY -= moveSpeed;
+      if (touchY > pizzaY) pizzaY += moveSpeed;
+    }
+  }
+  pizzaX = constrain(pizzaX, 20, 300);
+  pizzaY = constrain(pizzaY, 30, 220);
+
+  // Marshmallow Shield White Ring Indicator Around Player
+  if (upgMarshmallow > 0) {
+    float shieldRadius = 16 + (upgMarshmallow * 3);
+    canvas.drawCircle(pizzaX, pizzaY, shieldRadius, TFT_WHITE);
+    canvas.drawCircle(pizzaX, pizzaY, shieldRadius + 1, TFT_CYAN);
+  }
+
+  // Magnet spawn logic
+  if (pizzaLevel >= 7 && !magnetSpawnedOnce && !mapMagnet.active) {
+    mapMagnet.x = random(40, 280);
+    mapMagnet.y = random(40, 200);
+    mapMagnet.active = true;
+    magnetSpawnedOnce = true;
+  }
+
+  if (mapMagnet.active) {
+    canvas.fillCircle(mapMagnet.x, mapMagnet.y, 8, TFT_MAGENTA);
+    canvas.fillCircle(mapMagnet.x, mapMagnet.y, 4, TFT_WHITE);
+    canvas.drawCircle(mapMagnet.x, mapMagnet.y, 12, TFT_WHITE);
+    canvas.setTextSize(1);
+    canvas.setTextColor(TFT_MAGENTA, TFT_BLACK);
+    canvas.setCursor(mapMagnet.x - 12, mapMagnet.y - 14);
+    canvas.print("MAG");
+
+    float dx = pizzaX - mapMagnet.x;
+    float dy = pizzaY - mapMagnet.y;
+    if (dx*dx + dy*dy < 400) {
+      mapMagnet.active = false;
+      upgMagnet = max(1, upgMagnet);
+      playTone(800, 100);
+    }
+  }
+
+  // Knife Spin Topping Logic with Indicator Rings
+  if (upgKnifeSpin > 0) {
+    unsigned long currentMillis = millis();
+    if (!knifeSpinIsActive && currentMillis - knifeSpinCooldownTimer >= 1000) {
+      knifeSpinIsActive = true;
+      knifeSpinActiveTimer = currentMillis;
+    }
+    if (knifeSpinIsActive) {
+      if (currentMillis - knifeSpinActiveTimer >= 1000) {
+        knifeSpinIsActive = false;
+        knifeSpinCooldownTimer = currentMillis;
+      } else {
+        int knifeCount = 4 + (upgKnifeSpin * 2);
+        float spinAngleOffset = (currentMillis / 100.0);
+        float spinRadius = 25 + (upgKnifeSpin * 6);
+        
+        canvas.drawCircle(pizzaX, pizzaY, spinRadius, TFT_LIGHTGREY);
+
+        for(int k=0; k<knifeCount; k++) {
+          float ang = spinAngleOffset + (k * (6.28 / knifeCount));
+          float kx = pizzaX + cos(ang) * spinRadius;
+          float ky = pizzaY + sin(ang) * spinRadius;
+          canvas.fillCircle(kx, ky, 3, TFT_WHITE);
+          canvas.drawCircle(kx, ky, 5, TFT_CYAN);
+          
+          for(int e=0; e<24; e++) {
+            if(enemies[e].active) {
+              float edx = enemies[e].x - kx;
+              float edy = enemies[e].y - ky;
+              if(edx*edx + edy*edy < 144) {
+                enemies[e].hp -= (4 + upgKnifeSpin * 3);
+                if(enemies[e].hp <= 0) {
+                  enemies[e].active = false;
+                  if(enemies[e].type == 5) bossActive = false;
+                  for(int g=0; g<32; g++) {
+                    if(!gems[g].active) {
+                      gems[g].x = enemies[e].x;
+                      gems[g].y = enemies[e].y;
+                      gems[g].type = (enemies[e].type == 5) ? 1 : 0; 
+                      gems[g].active = true;
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          }
+          if (megaBoss.active) {
+            float mdx = megaBoss.x - kx;
+            float mdy = megaBoss.y - ky;
+            if(mdx*mdx + mdy*mdy < 400) {
+              megaBoss.hp -= (3 + upgKnifeSpin * 2);
+              if(megaBoss.hp <= 0) {
+                megaBoss.active = false;
+                megaBossActive = false;
+                for(int g=0; g<32; g++) {
+                  if(!gems[g].active) {
+                    gems[g].x = megaBoss.x;
+                    gems[g].y = megaBoss.y + 40;
+                    gems[g].type = 2; 
+                    gems[g].active = true;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Automatic Firing
+  int baseFireInterval = max(150, 550 - (upgSausage * 70) - ((upgPepperoni + upgMushroom + upgBacon) * 25));
+  float effectiveRange = 140.0 + (upgBasil * 40.0);
+  float maxRangeSq = effectiveRange * effectiveRange;
+
+  if (millis() - lastShotTick > baseFireInterval) {
+    int nearest = -1;
+    float minDist = 99999;
+    for(int i=0; i<24; i++) {
+      if(enemies[i].active) {
+        float d = pow(enemies[i].x - pizzaX, 2) + pow(enemies[i].y - pizzaY, 2);
+        if(d < minDist) { minDist = d; nearest = i; }
+      }
+    }
+    if (megaBoss.active && (minDist > pow(megaBoss.x - pizzaX, 2) + pow(megaBoss.y - pizzaY, 2))) {
+      nearest = -1; 
+    }
+    
+    if(nearest != -1 && minDist <= maxRangeSq) {
+      float angle = atan2(enemies[nearest].y - pizzaY, enemies[nearest].x - pizzaX);
+      
+      int pepCount = 1 + upgPepperoni; 
+      for(int p=0; p<pepCount; p++) {
+        float spreadAngle = angle + (p * 0.25) - ((pepCount - 1) * 0.125);
+        for(int i=0; i<96; i++) {
+          if(!projectiles[i].active) {
+            projectiles[i].x = pizzaX;
+            projectiles[i].y = pizzaY;
+            projectiles[i].vx = cos(spreadAngle) * 5.0;
+            projectiles[i].vy = sin(spreadAngle) * 5.0;
+            projectiles[i].type = 0;
+            projectiles[i].active = true;
+            break;
+          }
+        }
+      }
+
+      int mushCount = 1 + (upgMushroom > 1 ? upgMushroom - 1 : 0);
+      for(int m=0; m<mushCount; m++) {
+        float mAngle = angle + (m * 0.2) - ((mushCount - 1) * 0.1);
+        for(int i=0; i<96; i++) {
+          if(!projectiles[i].active) {
+            projectiles[i].x = pizzaX;
+            projectiles[i].y = pizzaY;
+            projectiles[i].vx = cos(mAngle) * 8.0;
+            projectiles[i].vy = sin(mAngle) * 8.0;
+            projectiles[i].type = 1;
+            projectiles[i].active = true;
+            break;
+          }
+        }
+      }
+
+      if(upgOlive > 0) {
+        for(int o=0; o<upgOlive; o++) {
+          for(int i=0; i<96; i++) {
+            if(!projectiles[i].active) {
+              projectiles[i].x = pizzaX;
+              projectiles[i].y = pizzaY;
+              projectiles[i].vx = cos(angle) * 3.0;
+              projectiles[i].vy = sin(angle) * 3.0;
+              projectiles[i].type = 2;
+              projectiles[i].active = true;
+              break;
+            }
+          }
+        }
+      }
+
+      if(upgBacon > 0) {
+        int baconLines = 2 + (upgBacon * 2);
+        for(int b=0; b<baconLines; b++) {
+          float bAngle = angle + (((float)b / (baconLines - 1)) * 0.8) - 0.4;
+          for(int i=0; i<96; i++) {
+            if(!projectiles[i].active) {
+              projectiles[i].x = pizzaX;
+              projectiles[i].y = pizzaY;
+              projectiles[i].vx = cos(bAngle) * 4.5;
+              projectiles[i].vy = sin(bAngle) * 4.5;
+              projectiles[i].type = 3;
+              projectiles[i].active = true;
+              break;
+            }
+          }
+        }
+      }
+
+      if(upgPineapple > 0 && (millis() % 2000 < 200)) {
+        for(int p=0; p<8; p++) {
+          float pAngle = p * (6.28 / 8.0);
+          for(int i=0; i<96; i++) {
+            if(!projectiles[i].active) {
+              projectiles[i].x = pizzaX;
+              projectiles[i].y = pizzaY;
+              projectiles[i].vx = cos(pAngle) * 3.5;
+              projectiles[i].vy = sin(pAngle) * 3.5;
+              projectiles[i].type = 6;
+              projectiles[i].active = true;
+              break;
+            }
+          }
+        }
+      }
+
+      if(upgOnion > 0) {
+        int onionCount = 3 + (upgOnion * 2);
+        for(int o=0; o<onionCount; o++) {
+          float oAngle = angle + (o * (1.57 / onionCount)) - 0.78;
+          for(int i=0; i<96; i++) {
+            if(!projectiles[i].active) {
+              projectiles[i].x = pizzaX;
+              projectiles[i].y = pizzaY;
+              projectiles[i].vx = cos(oAngle) * 6.5;
+              projectiles[i].vy = sin(oAngle) * 6.5;
+              projectiles[i].type = 7;
+              projectiles[i].active = true;
+              break;
+            }
+          }
+        }
+      }
+
+      if(upgJalapeno > 0) {
+        for(int j=0; j<2; j++) {
+          float jAngle = angle + random(-20, 20) / 100.0;
+          for(int i=0; i<96; i++) {
+            if(!projectiles[i].active) {
+              projectiles[i].x = pizzaX;
+              projectiles[i].y = pizzaY;
+              projectiles[i].vx = cos(jAngle) * 9.0;
+              projectiles[i].vy = sin(jAngle) * 9.0;
+              projectiles[i].type = 8;
+              projectiles[i].active = true;
+              break;
+            }
+          }
+        }
+      }
+
+      if(upgTruffle > 0 && (millis() % 3000 < 200)) {
+        for(int i=0; i<96; i++) {
+          if(!projectiles[i].active) {
+            projectiles[i].x = pizzaX;
+            projectiles[i].y = pizzaY;
+            projectiles[i].vx = 0;
+            projectiles[i].vy = 0;
+            projectiles[i].type = 11;
+            projectiles[i].active = true;
+            break;
+          }
+        }
+      }
+
+      if(upgAnchovy > 0) {
+        for(int i=0; i<96; i++) {
+          if(!projectiles[i].active) {
+            projectiles[i].x = pizzaX;
+            projectiles[i].y = pizzaY;
+            projectiles[i].vx = cos(angle) * 7.0;
+            projectiles[i].vy = sin(angle) * 7.0;
+            projectiles[i].type = 12;
+            projectiles[i].active = true;
+            break;
+          }
+        }
+      }
+
+      if(upgHoney > 0 && (millis() % 2500 < 200)) {
+        for(int i=0; i<96; i++) {
+          if(!projectiles[i].active) {
+            projectiles[i].x = pizzaX;
+            projectiles[i].y = pizzaY;
+            projectiles[i].vx = cos(angle) * 2.5;
+            projectiles[i].vy = sin(angle) * 2.5;
+            projectiles[i].type = 13;
+            projectiles[i].active = true;
+            break;
+          }
+        }
+      }
+
+      if(upgPotato > 0 && (millis() % 2000 < 200)) {
+        for(int i=0; i<96; i++) {
+          if(!projectiles[i].active) {
+            projectiles[i].x = pizzaX;
+            projectiles[i].y = pizzaY;
+            projectiles[i].vx = cos(angle) * 4.5;
+            projectiles[i].vy = sin(angle) * 4.5;
+            projectiles[i].type = 14;
+            projectiles[i].active = true;
+            break;
+          }
+        }
+      }
+
+      if(upgHotSauce > 0) {
+        for(int i=0; i<96; i++) {
+          if(!projectiles[i].active) {
+            projectiles[i].x = pizzaX;
+            projectiles[i].y = pizzaY;
+            projectiles[i].vx = cos(angle) * 8.5;
+            projectiles[i].vy = sin(angle) * 8.5;
+            projectiles[i].type = 15;
+            projectiles[i].active = true;
+            break;
+          }
+        }
+      }
+
+    } else if (megaBoss.active) {
+      float angle = atan2(megaBoss.y - pizzaY, megaBoss.x - pizzaX);
+      for(int i=0; i<96; i++) {
+        if(!projectiles[i].active) {
+          projectiles[i].x = pizzaX;
+          projectiles[i].y = pizzaY;
+          projectiles[i].vx = cos(angle) * 6.0;
+          projectiles[i].vy = sin(angle) * 6.0;
+          projectiles[i].type = 1;
+          projectiles[i].active = true;
+          break;
+        }
+      }
+    }
+
+    lastShotTick = millis();
+    playTone(300, 30);
+  }
+
+  // Garlic Aura with Outer Indicator Ring
+  if(upgGarlic > 0) {
+    float auraRadius = 35 + (upgGarlic * 15);
+    canvas.drawCircle(pizzaX, pizzaY, auraRadius, TFT_GREEN);
+    canvas.drawCircle(pizzaX, pizzaY, auraRadius + 2, TFT_WHITE);
+    canvas.drawCircle(pizzaX, pizzaY, auraRadius + 1, TFT_GREEN);
+
+    for(int e=0; e<24; e++) {
+      if(enemies[e].active) {
+        float dx = enemies[e].x - pizzaX;
+        float dy = enemies[e].y - pizzaY;
+        if(dx*dx + dy*dy < auraRadius * auraRadius) {
+          enemies[e].hp -= (6 + upgGarlic * 6);
+          if(enemies[e].hp <= 0) {
+            enemies[e].active = false;
+            if(enemies[e].type == 5) bossActive = false;
+            for(int g=0; g<32; g++) {
+              if(!gems[g].active) {
+                gems[g].x = enemies[e].x;
+                gems[g].y = enemies[e].y;
+                gems[g].type = (enemies[e].type == 5) ? 1 : 0;
+                gems[g].active = true;
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (megaBoss.active) {
+      float mdx = megaBoss.x - pizzaX;
+      float mdy = megaBoss.y - pizzaY;
+      if(mdx*mdx + mdy*mdy < auraRadius * auraRadius) {
+        megaBoss.hp -= (4 + upgGarlic * 4);
+        if(megaBoss.hp <= 0) {
+          megaBoss.active = false;
+          megaBossActive = false;
+          for(int g=0; g<32; g++) {
+            if(!gems[g].active) {
+              gems[g].x = megaBoss.x;
+              gems[g].y = megaBoss.y + 40;
+              gems[g].type = 2; 
+              gems[g].active = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Update Projectiles
+  for(int i=0; i<96; i++) {
+    if(projectiles[i].active) {
+      if(projectiles[i].type == 2 || projectiles[i].type == 12) {
+        int nearest = -1;
+        float minDist = 99999;
+        for(int e=0; e<24; e++) {
+          if(enemies[e].active) {
+            float d = pow(enemies[e].x - projectiles[i].x, 2) + pow(enemies[e].y - projectiles[i].y, 2);
+            if(d < minDist) { minDist = d; nearest = e; }
+          }
+        }
+        if(nearest != -1) {
+          float targetAngle = atan2(enemies[nearest].y - projectiles[i].y, enemies[nearest].x - projectiles[i].x);
+          float spd = (projectiles[i].type == 12) ? 7.0 : 3.5;
+          projectiles[i].vx = cos(targetAngle) * spd;
+          projectiles[i].vy = sin(targetAngle) * spd;
+        }
+      }
+
+      projectiles[i].x += projectiles[i].vx;
+      projectiles[i].y += projectiles[i].vy;
+
+      if(projectiles[i].x < -20 || projectiles[i].x > 340 || projectiles[i].y < -20 || projectiles[i].y > 260) {
+        projectiles[i].active = false;
+      } else {
+        if(projectiles[i].type == 4 || projectiles[i].type == 5 || projectiles[i].type == 9 || projectiles[i].type == 10) {
+          float dx = projectiles[i].x - pizzaX;
+          float dy = projectiles[i].y - pizzaY;
+          if(dx*dx + dy*dy < 144) {
+            int dmg = (projectiles[i].type == 10) ? 25 : 20;
+            if (upgMarshmallow > 0) dmg = max(2, dmg - (upgMarshmallow * 4));
+            
+            pizzaHP -= dmg;
+            projectiles[i].active = false;
+            playTone(120, 80);
+            if(pizzaHP <= 0) {
+              currentGameState = PIZZA_GAME_OVER;
+              return;
+            }
+          }
+        } else {
+          if (megaBoss.active) {
+            float mdx = projectiles[i].x - megaBoss.x;
+            float mdy = projectiles[i].y - megaBoss.y;
+            if (mdx*mdx + mdy*mdy < 900) {
+              int dmg = 14;
+              if(projectiles[i].type == 0) dmg += (upgPepperoni * 8);
+              else if(projectiles[i].type == 1) { dmg = 35 + (upgMushroom * 15); }
+              else if(projectiles[i].type == 2) { dmg = 70 + (upgOlive * 25); }
+              else if(projectiles[i].type == 3) { dmg = 18 + (upgBacon * 10); }
+              else if(projectiles[i].type == 6) { dmg = 45 + (upgPineapple * 20); }
+              else if(projectiles[i].type == 7) { dmg = 30 + (upgOnion * 15); }
+              else if(projectiles[i].type == 8) { dmg = 25 + (upgJalapeno * 12); }
+              else if(projectiles[i].type == 11) { dmg = 85 + (upgTruffle * 30); }
+              else if(projectiles[i].type == 12) { dmg = 40 + (upgAnchovy * 15); }
+              else if(projectiles[i].type == 13) { dmg = 20 + (upgHoney * 10); }
+              else if(projectiles[i].type == 14) { dmg = 75 + (upgPotato * 25); }
+              else if(projectiles[i].type == 15) { dmg = 50 + (upgHotSauce * 20); }
+
+              megaBoss.hp -= dmg;
+
+              if(projectiles[i].type == 13 || projectiles[i].type == 14 || projectiles[i].type == 15) {
+                for(int a=0; a<16; a++) {
+                  if(!areaEffects[a].active) {
+                    areaEffects[a].x = projectiles[i].x;
+                    areaEffects[a].y = projectiles[i].y;
+                    areaEffects[a].radius = (projectiles[i].type == 14) ? 28 : 20;
+                    areaEffects[a].color = (projectiles[i].type == 13) ? TFT_YELLOW : ((projectiles[i].type == 14) ? TFT_BROWN : TFT_RED);
+                    areaEffects[a].duration = 40;
+                    areaEffects[a].active = true;
+                    break;
+                  }
+                }
+              }
+
+              if(projectiles[i].type != 1 && projectiles[i].type != 7) projectiles[i].active = false;
+
+              if(megaBoss.hp <= 0) {
+                megaBoss.active = false;
+                megaBossActive = false;
+                for(int g=0; g<32; g++) {
+                  if(!gems[g].active) {
+                    gems[g].x = megaBoss.x;
+                    gems[g].y = megaBoss.y + 40;
+                    gems[g].type = 2; 
+                    gems[g].active = true;
+                    break;
+                  }
+                }
+              }
+              break;
+            }
+          }
+
+          for(int e=0; e<24; e++) {
+            if(enemies[e].active) {
+              float dx = projectiles[i].x - enemies[e].x;
+              float dy = projectiles[i].y - enemies[e].y;
+              float hitRadius = (enemies[e].type == 5) ? 550 : 140;
+              
+              if(dx*dx + dy*dy < hitRadius) {
+                int dmg = 14;
+                if(projectiles[i].type == 0) dmg += (upgPepperoni * 8);
+                else if(projectiles[i].type == 1) { dmg = 35 + (upgMushroom * 15); }
+                else if(projectiles[i].type == 2) { dmg = 70 + (upgOlive * 25); }
+                else if(projectiles[i].type == 3) { dmg = 18 + (upgBacon * 10); }
+                else if(projectiles[i].type == 6) { dmg = 45 + (upgPineapple * 20); }
+                else if(projectiles[i].type == 7) { dmg = 30 + (upgOnion * 15); }
+                else if(projectiles[i].type == 8) { dmg = 25 + (upgJalapeno * 12); }
+                else if(projectiles[i].type == 11) { dmg = 85 + (upgTruffle * 30); }
+                else if(projectiles[i].type == 12) { dmg = 40 + (upgAnchovy * 15); }
+                else if(projectiles[i].type == 13) { dmg = 20 + (upgHoney * 10); }
+                else if(projectiles[i].type == 14) { dmg = 75 + (upgPotato * 25); }
+                else if(projectiles[i].type == 15) { dmg = 50 + (upgHotSauce * 20); }
+
+                enemies[e].hp -= dmg;
+
+                if(projectiles[i].type == 13 || projectiles[i].type == 14 || projectiles[i].type == 15) {
+                  for(int a=0; a<16; a++) {
+                    if(!areaEffects[a].active) {
+                      areaEffects[a].x = projectiles[i].x;
+                      areaEffects[a].y = projectiles[i].y;
+                      areaEffects[a].radius = (projectiles[i].type == 14) ? 28 : 20;
+                      areaEffects[a].color = (projectiles[i].type == 13) ? TFT_YELLOW : ((projectiles[i].type == 14) ? TFT_BROWN : TFT_RED);
+                      areaEffects[a].duration = 40;
+                      areaEffects[a].active = true;
+                      break;
+                    }
+                  }
+                }
+
+                if(projectiles[i].type != 1 && projectiles[i].type != 7) projectiles[i].active = false;
+
+                if(enemies[e].hp <= 0) {
+                  enemies[e].active = false;
+                  if(enemies[e].type == 5) bossActive = false;
+                  
+                  for(int g=0; g<32; g++) {
+                    if(!gems[g].active) {
+                      gems[g].x = enemies[e].x;
+                      gems[g].y = enemies[e].y;
+                      gems[g].type = (enemies[e].type == 5) ? 1 : 0; 
+                      gems[g].active = true;
+                      break;
+                    }
+                  }
+                }
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Draw Projectiles with High-Contrast Indicator Rings/Outlines
+  for(int i=0; i<96; i++) {
+    if(projectiles[i].active) {
+      if(projectiles[i].type == 0) {
+        canvas.fillCircle(projectiles[i].x, projectiles[i].y, 5, TFT_MAROON);
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 7, TFT_WHITE);
+      }
+      else if(projectiles[i].type == 1) {
+        canvas.fillCircle(projectiles[i].x, projectiles[i].y, 4, TFT_MAGENTA);
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 6, TFT_WHITE);
+      }
+      else if(projectiles[i].type == 2) {
+        canvas.fillRect(projectiles[i].x - 1, projectiles[i].y, 3, 5, TFT_LIGHTGREY); 
+        canvas.fillEllipse(projectiles[i].x, projectiles[i].y - 2, 7, 4, TFT_RED);
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 8, TFT_WHITE);
+      }
+      else if(projectiles[i].type == 3) {
+        canvas.fillRect(projectiles[i].x - 4, projectiles[i].y - 2, 8, 4, TFT_PINK);
+        canvas.drawRect(projectiles[i].x - 5, projectiles[i].y - 3, 10, 6, TFT_WHITE);
+      }
+      else if(projectiles[i].type == 6) {
+        canvas.fillCircle(projectiles[i].x, projectiles[i].y, 6, TFT_YELLOW);
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 8, TFT_WHITE);
+      }
+      else if(projectiles[i].type == 7) {
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 5, TFT_WHITE);
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 7, TFT_YELLOW);
+      }
+      else if(projectiles[i].type == 8) {
+        canvas.fillCircle(projectiles[i].x, projectiles[i].y, 3, TFT_RED);
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 5, TFT_WHITE);
+      }
+      else if(projectiles[i].type == 11) {
+        canvas.fillCircle(projectiles[i].x, projectiles[i].y, 8, TFT_DARKGREY);
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 10, TFT_WHITE);
+      }
+      else if(projectiles[i].type == 12) {
+        canvas.fillCircle(projectiles[i].x, projectiles[i].y, 3, TFT_CYAN);
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 5, TFT_WHITE);
+      }
+      else if(projectiles[i].type == 13) {
+        canvas.fillCircle(projectiles[i].x, projectiles[i].y, 5, TFT_YELLOW);
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 7, TFT_WHITE);
+      }
+      else if(projectiles[i].type == 14) {
+        canvas.fillCircle(projectiles[i].x, projectiles[i].y, 7, TFT_BROWN);
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 9, TFT_WHITE);
+      }
+      else if(projectiles[i].type == 15) {
+        canvas.fillCircle(projectiles[i].x, projectiles[i].y, 4, TFT_RED);
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 6, TFT_WHITE);
+      }
+      else if(projectiles[i].type == 4 || projectiles[i].type == 5 || projectiles[i].type == 9) {
+        canvas.fillCircle(projectiles[i].x, projectiles[i].y, 6, TFT_ORANGE);
+        canvas.fillCircle(projectiles[i].x, projectiles[i].y, 3, TFT_YELLOW);
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 8, TFT_WHITE);
+      }
+      else if(projectiles[i].type == 10) {
+        canvas.fillCircle(projectiles[i].x, projectiles[i].y, 7, TFT_WHITE);
+        canvas.drawCircle(projectiles[i].x, projectiles[i].y, 9, TFT_CYAN);
+      }
+    }
+  }
+
+  // Determine Spawning Conditions
+  bool isMegaBossLevel = (pizzaLevel >= 10 && !megaBossSpawnedThisRun);
+  int activeEnemyCount = 0;
+  for(int i=0; i<24; i++) { if(enemies[i].active) activeEnemyCount++; }
+
+  if (isMegaBossLevel && !megaBossActive && activeEnemyCount == 0) {
+    megaBoss.x = 160;
+    megaBoss.y = 40;
+    megaBoss.maxHp = 3000 + (pizzaLevel * 500);
+    megaBoss.hp = megaBoss.maxHp;
+    megaBoss.active = true;
+    megaBossActive = true;
+    megaBossSpawnedThisRun = true;
+    megaBoss.attackCooldown = millis();
+  }
+
+  // Spawn regular enemies / ranged attackers
+  int dynamicSpawnInterval = max(250, 1400 - (pizzaWave * 70));
+  if(!megaBossActive && millis() - spawnTick > dynamicSpawnInterval) {
+    if(pizzaWave % 5 == 0 && !bossActive && !isMegaBossLevel) {
+      for(int i=0; i<24; i++) {
+        if(!enemies[i].active) {
+          float angle = random(0, 628) / 100.0;
+          enemies[i].x = pizzaX + cos(angle) * 160;
+          enemies[i].y = pizzaY + sin(angle) * 160;
+          enemies[i].maxHp = 600 + (pizzaWave * 200);
+          enemies[i].hp = enemies[i].maxHp;
+          enemies[i].type = 5; 
+          enemies[i].active = true;
+          enemies[i].lastShot = millis();
+          bossActive = true;
+          break;
+        }
+      }
+    } else if (!isMegaBossLevel) {
+      int maxAllowedEnemies = min(22, 4 + pizzaWave);
+
+      if(activeEnemyCount < maxAllowedEnemies) {
+        for(int i=0; i<24; i++) {
+          if(!enemies[i].active) {
+            float angle = random(0, 628) / 100.0;
+            enemies[i].x = pizzaX + cos(angle) * 150;
+            enemies[i].y = pizzaY + sin(angle) * 150;
+            
+            int roll = random(0, 100);
+            if(pizzaWave >= 3 && roll < 18) {
+              enemies[i].type = 6; 
+              enemies[i].maxHp = 35 + (pizzaWave * 12);
+            } else if(pizzaWave >= 4 && roll < 32) {
+              enemies[i].type = 7; 
+              enemies[i].maxHp = 50 + (pizzaWave * 16);
+            } else if(pizzaWave >= 4 && roll < 50) {
+              enemies[i].type = 4; 
+              enemies[i].maxHp = 50 + (pizzaWave * 22);
+            } else if(pizzaWave >= 3 && roll < 68) {
+              enemies[i].type = 3; 
+              enemies[i].maxHp = 35 + (pizzaWave * 15);
+            } else {
+              enemies[i].type = 0; 
+              enemies[i].maxHp = 40 + (pizzaWave * 20);
+            }
+            
+            enemies[i].hp = enemies[i].maxHp;
+            enemies[i].active = true;
+            enemies[i].lastShot = millis();
+            break;
+          }
+        }
+      }
+    }
+    spawnTick = millis();
+  }
+
+  // Boss Ranged Fire Attack Timer
+  if (bossActive && millis() - bossFireTick > 2000) {
+    for(int i=0; i<24; i++) {
+      if(enemies[i].active && enemies[i].type == 5) {
+        float angle = atan2(pizzaY - enemies[i].y, pizzaX - enemies[i].x);
+        for(int p=0; p<96; p++) {
+          if(!projectiles[p].active) {
+            projectiles[p].x = enemies[i].x;
+            projectiles[p].y = enemies[i].y;
+            projectiles[p].vx = cos(angle) * 4.0;
+            projectiles[p].vy = sin(angle) * 4.0;
+            projectiles[p].type = 4;
+            projectiles[p].active = true;
+            break;
+          }
+        }
+      }
+    }
+    bossFireTick = millis();
+  }
+
+  // Ranged Enemy Attack Logic
+  for(int i=0; i<24; i++) {
+    if(enemies[i].active && (enemies[i].type == 6 || enemies[i].type == 7)) {
+      unsigned long shootInterval = (enemies[i].type == 6) ? 2200 : 1600;
+      if(millis() - enemies[i].lastShot > shootInterval) {
+        float angle = atan2(pizzaY - enemies[i].y, pizzaX - enemies[i].x);
+        for(int p=0; p<96; p++) {
+          if(!projectiles[p].active) {
+            projectiles[p].x = enemies[i].x;
+            projectiles[p].y = enemies[i].y;
+            if(enemies[i].type == 6) {
+              projectiles[p].vx = cos(angle) * 3.5;
+              projectiles[p].vy = sin(angle) * 3.5;
+              projectiles[p].type = 9; 
+            } else {
+              projectiles[p].vx = cos(angle) * 5.5;
+              projectiles[p].vy = sin(angle) * 5.5;
+              projectiles[p].type = 10; 
+            }
+            projectiles[p].active = true;
+            break;
+          }
+        }
+        enemies[i].lastShot = millis();
+      }
+    }
+  }
+
+  // Mega Boss Bullet Patterns
+  if (megaBoss.active && millis() - megaBossFireTick > 1500) {
+    float baseAngle = random(0, 628) / 100.0;
+    int patternBullets = 8;
+    for(int b=0; b<patternBullets; b++) {
+      float ang = baseAngle + (b * (6.28 / patternBullets));
+      for(int p=0; p<96; p++) {
+        if(!projectiles[p].active) {
+          projectiles[p].x = megaBoss.x;
+          projectiles[p].y = megaBoss.y;
+          projectiles[p].vx = cos(ang) * 3.5;
+          projectiles[p].vy = sin(ang) * 3.5;
+          projectiles[p].type = 5;
+          projectiles[p].active = true;
+          break;
+        }
+      }
+    }
+    megaBossFireTick = millis();
+  }
+
+  // Update & Draw Regular Enemies
+  for(int i=0; i<24; i++) {
+    if(enemies[i].active) {
+      float angle = atan2(pizzaY - enemies[i].y, pizzaX - enemies[i].x);
+      
+      float spd = 1.0 + (pizzaWave * 0.08);
+      if(enemies[i].type == 1) spd = 1.6 + (pizzaWave * 0.09);       
+      else if(enemies[i].type == 2) spd = 0.75 + (pizzaWave * 0.05);  
+      else if(enemies[i].type == 3) spd = 1.2 + (pizzaWave * 0.07);  
+      else if(enemies[i].type == 4) spd = 1.4 + (pizzaWave * 0.08);  
+      else if(enemies[i].type == 5) spd = 0.45 + (pizzaWave * 0.03);  
+      else if(enemies[i].type == 6) spd = 0.8 + (pizzaWave * 0.04); 
+      else if(enemies[i].type == 7) spd = 1.1 + (pizzaWave * 0.06);
+
+      float distToPlayer = sqrt(pow(pizzaX - enemies[i].x, 2) + pow(pizzaY - enemies[i].y, 2));
+      if(enemies[i].type == 6 && distToPlayer < 90) {
+        enemies[i].x -= cos(angle) * spd;
+        enemies[i].y -= sin(angle) * spd;
+      } else {
+        enemies[i].x += cos(angle) * spd;
+        enemies[i].y += sin(angle) * spd;
+      }
+
+      if(enemies[i].type == 0) { 
+        canvas.drawLine(enemies[i].x - 4, enemies[i].y - 8, enemies[i].x - 4, enemies[i].y + 8, TFT_LIGHTGREY);
+        canvas.drawLine(enemies[i].x, enemies[i].y - 8, enemies[i].x, enemies[i].y + 8, TFT_LIGHTGREY);
+        canvas.drawLine(enemies[i].x + 4, enemies[i].y - 8, enemies[i].x + 4, enemies[i].y + 8, TFT_LIGHTGREY);
+        canvas.drawLine(enemies[i].x - 6, enemies[i].y + 8, enemies[i].x + 6, enemies[i].y + 8, TFT_LIGHTGREY);
+        canvas.drawLine(enemies[i].x, enemies[i].y + 8, enemies[i].x, enemies[i].y + 14, TFT_BROWN);
+      } else if(enemies[i].type == 1) { 
+        canvas.drawLine(enemies[i].x - 8, enemies[i].y + 8, enemies[i].x + 8, enemies[i].y - 8, TFT_WHITE);
+        canvas.drawLine(enemies[i].x - 6, enemies[i].y + 6, enemies[i].x - 8, enemies[i].y + 8, TFT_DARKGREY);
+      } else if(enemies[i].type == 2) { 
+        canvas.fillCircle(enemies[i].x, enemies[i].y, 9, TFT_LIGHTGREY);
+        canvas.drawCircle(enemies[i].x, enemies[i].y, 9, TFT_WHITE);
+        canvas.drawLine(enemies[i].x, enemies[i].y, enemies[i].x - 10, enemies[i].y + 10, TFT_BROWN);
+      } else if(enemies[i].type == 3) { 
+        canvas.fillCircle(enemies[i].x, enemies[i].y - 4, 6, TFT_LIGHTGREY);
+        canvas.drawLine(enemies[i].x, enemies[i].y + 2, enemies[i].x, enemies[i].y + 12, TFT_LIGHTGREY);
+      } else if(enemies[i].type == 4) { 
+        canvas.drawCircle(enemies[i].x, enemies[i].y - 4, 8, TFT_WHITE);
+        canvas.drawLine(enemies[i].x, enemies[i].y + 4, enemies[i].x, enemies[i].y + 12, TFT_LIGHTGREY);
+      } else if(enemies[i].type == 5) { 
+        canvas.fillRoundRect(enemies[i].x - 20, enemies[i].y - 14, 40, 28, 6, TFT_DARKGREY);
+        canvas.fillCircle(enemies[i].x, enemies[i].y, 10, TFT_RED);
+        int barW = (enemies[i].hp * 50) / enemies[i].maxHp;
+        canvas.fillRect(enemies[i].x - 25, enemies[i].y - 24, 50, 5, TFT_BLACK);
+        canvas.fillRect(enemies[i].x - 25, enemies[i].y - 24, barW, 5, TFT_RED);
+      } else if(enemies[i].type == 6) {
+        canvas.fillRoundRect(enemies[i].x - 6, enemies[i].y - 8, 12, 16, 3, TFT_WHITE);
+        canvas.fillRect(enemies[i].x - 4, enemies[i].y - 10, 8, 3, TFT_LIGHTGREY);
+      } else if(enemies[i].type == 7) {
+        canvas.fillRect(enemies[i].x - 10, enemies[i].y - 4, 20, 8, TFT_BROWN);
+        canvas.fillCircle(enemies[i].x - 10, enemies[i].y, 5, TFT_DARKGREY);
+        canvas.fillCircle(enemies[i].x + 10, enemies[i].y, 5, TFT_DARKGREY);
+      }
+
+      float dx = enemies[i].x - pizzaX;
+      float dy = enemies[i].y - pizzaY;
+      float collisionDist = (enemies[i].type == 5) ? 400 : 160;
+      if(dx*dx + dy*dy < collisionDist) {
+        int contactDamage = (enemies[i].type == 5) ? (8 + pizzaWave * 2) : (4 + pizzaWave);
+        if (upgMarshmallow > 0) contactDamage = max(1, contactDamage - (upgMarshmallow * 2));
+
+        pizzaHP -= contactDamage;
+        playTone(150, 80);
+        if(pizzaHP <= 0) {
+          currentGameState = PIZZA_GAME_OVER;
+          return;
+        }
+      }
+    }
+  }
+
+  // Draw and Update Mega Boss
+  if (megaBoss.active) {
+    canvas.fillRoundRect(megaBoss.x - 35, megaBoss.y - 18, 70, 36, 8, TFT_RED);
+    canvas.fillCircle(megaBoss.x, megaBoss.y, 14, TFT_YELLOW);
+    int mbarW = (megaBoss.hp * 160) / megaBoss.maxHp;
+    canvas.fillRect(megaBoss.x - 80, megaBoss.y - 28, 160, 8, TFT_BLACK);
+    canvas.fillRect(megaBoss.x - 80, megaBoss.y - 28, mbarW, 8, TFT_RED);
+    canvas.drawRect(megaBoss.x - 80, megaBoss.y - 28, 160, 8, TFT_WHITE);
+  }
+
+  // Update & Draw Gems
+  if (upgMagnet > 0) {
+    float magnetRange = 32 + (upgMagnet * 21);
+    canvas.drawCircle(pizzaX, pizzaY, magnetRange, TFT_PURPLE);
+    canvas.drawCircle(pizzaX, pizzaY, magnetRange + 1, TFT_WHITE);
+  }
+
+  for(int i=0; i<32; i++) {
+    if(gems[i].active) {
+      if (upgMagnet > 0) {
+        float magnetRange = 32 + (upgMagnet * 21);
+        float dx = pizzaX - gems[i].x;
+        float dy = pizzaY - gems[i].y;
+        float distSq = dx*dx + dy*dy;
+        if (distSq < magnetRange * magnetRange) {
+          float angle = atan2(dy, dx);
+          gems[i].x += cos(angle) * 3.5;
+          gems[i].y += sin(angle) * 3.5;
+        }
+      }
+
+      uint16_t gemColor = TFT_YELLOW;
+      if(gems[i].type == 1) gemColor = TFT_ORANGE;
+      else if(gems[i].type == 2) gemColor = TFT_CYAN;
+
+      canvas.fillCircle(gems[i].x, gems[i].y, gems[i].type > 0 ? 5 : 3, gemColor);
+      canvas.drawCircle(gems[i].x, gems[i].y, gems[i].type > 0 ? 7 : 5, TFT_WHITE);
+      
+      float dx = pizzaX - gems[i].x;
+      float dy = pizzaY - gems[i].y;
+      if(dx*dx + dy*dy < 400) { 
+        gems[i].active = false;
+        int xpGain = 15;
+        if(gems[i].type == 1) xpGain = 30;
+        else if(gems[i].type == 2) xpGain = 45;
+        
+        pizzaXP += xpGain;
+        saveHighScore("pizza", pizzaXP);
+        playTone(1000, 40);
+
+        if(pizzaXP >= nextLevelXP) {
+          int available[20] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+          int validCount = 20;
+          
+          if (upgMagnet >= 3) {
+            for(int k=0; k<20; k++) {
+              if(available[k] == 9) {
+                for(int j=k; j<19; j++) available[j] = available[j+1];
+                validCount = 19;
+                break;
+              }
+            }
+          }
+
+          for(int k=0; k<validCount; k++) {
+            int r = random(0, validCount);
+            int temp = available[k];
+            available[k] = available[r];
+            available[r] = temp;
+          }
+          currentRandomUpgrades[0] = available[0];
+          currentRandomUpgrades[1] = available[1];
+          currentRandomUpgrades[2] = available[2];
+
+          currentGameState = PIZZA_UPGRADE_WARNING; 
+          delay(200);
+          return;
+        }
+      }
+    }
+  }
+
+  // Draw Pizza Hero Character
+  canvas.fillTriangle(pizzaX, pizzaY - 10, pizzaX - 10, pizzaY + 8, pizzaX + 10, pizzaY + 8, TFT_YELLOW);
+  canvas.drawTriangle(pizzaX, pizzaY - 11, pizzaX - 11, pizzaY + 9, pizzaX + 11, pizzaY + 9, TFT_WHITE);
+  canvas.fillCircle(pizzaX - 3, pizzaY, 2, TFT_RED);
+  canvas.fillCircle(pizzaX + 4, pizzaY + 3, 2, TFT_RED);
+
+  int barWidth = 30;
+  int barHeight = 4;
+  int barX = pizzaX - (barWidth / 2);
+  int barY = pizzaY + 13;
+  canvas.drawRect(barX, barY, barWidth, barHeight, TFT_DARKGREY);
+  int currentLevelXPBase = nextLevelXP - (50 + (pizzaLevel * 18));
+  int xpIntoLevel = pizzaXP - currentLevelXPBase;
+  int xpNeededForLevel = nextLevelXP - currentLevelXPBase;
+  int filledWidth = (xpIntoLevel * barWidth) / xpNeededForLevel;
+  filledWidth = constrain(filledWidth, 0, barWidth);
+  canvas.fillRect(barX + 1, barY + 1, filledWidth, barHeight - 2, TFT_CYAN);
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  canvas.setCursor(5, 5); canvas.print("HP:"); canvas.print(pizzaHP);
+  canvas.setCursor(70, 5); canvas.print("XP:"); canvas.print(pizzaXP);
+  canvas.setCursor(135, 5); canvas.print("LVL:"); canvas.print(pizzaLevel);
+  canvas.setCursor(200, 5); canvas.print("W:"); canvas.print(pizzaWave);
+  
+  canvas.fillRoundRect(270, 3, 45, 18, 4, TFT_NAVY);
+  canvas.setTextColor(TFT_WHITE, TFT_NAVY);
+  canvas.setCursor(278, 8); canvas.print("PAUSE");
+}
+
+void runPizzaPause() {
+  canvas.fillScreen(TFT_BLACK);
+  canvas.setTextSize(2);
+  canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  canvas.setCursor(110, 20); canvas.print("PAUSED");
+
+  canvas.fillRoundRect(80, 70, 160, 36, 6, TFT_NAVY);
+  canvas.setTextSize(1);
+  canvas.setTextColor(TFT_WHITE, TFT_NAVY);
+  canvas.setCursor(130, 82); canvas.print("RESUME");
+
+  canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  canvas.setCursor(90, 120); canvas.print("VOLUME: "); canvas.print(soundVolume);
+  
+  canvas.fillRoundRect(50, 138, 40, 30, 4, TFT_DARKGREY);
+  canvas.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  canvas.setCursor(65, 148); canvas.print("-");
+  
+  for(int i=0; i<=10; i++) {
+    uint16_t col = (i <= soundVolume) ? TFT_GREEN : TFT_DARKGREY;
+    canvas.fillRect(100 + (i * 12), 143, 10, 20, col);
+  }
+
+  canvas.fillRoundRect(230, 138, 40, 30, 4, TFT_DARKGREY);
+  canvas.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  canvas.setCursor(245, 148); canvas.print("+");
+
+  canvas.fillRoundRect(80, 185, 160, 36, 6, TFT_MAROON);
+  canvas.setTextColor(TFT_WHITE, TFT_MAROON);
+  canvas.setCursor(125, 197); canvas.print("MAIN MENU");
+
+  canvas.pushSprite(0, 0);
+
+  if (touchPressed && !lastTouchState) {
+    if (touchX >= 80 && touchX <= 240) {
+      if (touchY >= 70 && touchY <= 106) {
+        lastTouchState = true;
+        currentGameState = PIZZA_HERO;
+        delay(200);
+      } else if (touchY >= 185 && touchY <= 221) {
+        lastTouchState = true;
+        currentGameState = MENU;
+        delay(200);
+      }
+    }
+    if (touchY >= 138 && touchY <= 168) {
+      if (touchX >= 50 && touchX <= 90) {
+        soundVolume = max(0, soundVolume - 1);
+        saveVolumeSetting();
+        playTone(500, 50);
+        delay(150);
+      } else if (touchX >= 230 && touchX <= 270) {
+        soundVolume = min(10, soundVolume + 1);
+        saveVolumeSetting();
+        playTone(700, 50);
+        delay(150);
+      }
+    }
+  }
+}
+
+void runPizzaUpgradeWarning() {
+  canvas.fillScreen(TFT_BLACK);
+  canvas.setTextSize(2);
+  canvas.setTextColor(TFT_CYAN, TFT_BLACK);
+  canvas.setCursor(65, 50); canvas.print("LEVEL UP!");
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  canvas.setCursor(65, 100); canvas.print("LIFT PEN TO CONTINUE");
+  
+  canvas.fillRoundRect(80, 150, 160, 40, 6, TFT_DARKGREY);
+  canvas.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  canvas.setCursor(125, 164); canvas.print("READY");
+
+  canvas.pushSprite(0, 0);
+
+  if (!touch.touched()) {
+    currentGameState = PIZZA_UPGRADE;
+    delay(200);
+  }
+}
+
+void runPizzaUpgrade() {
+  canvas.fillScreen(TFT_BLACK);
+  canvas.setTextSize(2);
+  canvas.setTextColor(TFT_YELLOW, TFT_BLACK);
+  canvas.setCursor(70, 10); canvas.print("CHOOSE UPGRADE");
+
+  canvas.setTextSize(1);
+
+  for(int i = 0; i < 3; i++) {
+    int upgType = currentRandomUpgrades[i];
+    int boxY = 48 + (i * 62);
+    uint16_t boxColor = TFT_DARKGREY;
+    uint16_t textColor = TFT_WHITE;
+    String label = "";
+    String desc = "";
+
+    if(upgType == 0) { boxColor = TFT_MAROON; label = "Pepperoni Shot"; desc = "Fires extra projectile shots"; }
+    else if(upgType == 1) { boxColor = TFT_PURPLE; label = "Mushroom Railgun"; desc = "High pierce damage beams"; }
+    else if(upgType == 2) { boxColor = TFT_DARKGREY; label = "Mushroom Missile"; desc = "Fires homing missiles"; }
+    else if(upgType == 3) { boxColor = TFT_ORANGE; label = "Bacon Spread"; desc = "Fires spread lines of bacon"; }
+    else if(upgType == 4) { boxColor = TFT_GREEN; label = "Garlic Aura"; desc = "Damaging aura around player"; }
+    else if(upgType == 5) { boxColor = TFT_NAVY; label = "Extra Cheese"; desc = "Boosts max HP and heals"; }
+    else if(upgType == 6) { boxColor = TFT_DARKGREEN; label = "Crispy Crust"; desc = "Increases movement speed"; }
+    else if(upgType == 7) { boxColor = TFT_YELLOW; label = "Sausage"; desc = "Increases attack firing speed"; textColor = TFT_BLACK; }
+    else if(upgType == 8) { boxColor = TFT_CYAN; label = "Basil"; desc = "Expands automatic weapon range"; textColor = TFT_BLACK; }
+    else if(upgType == 9) { boxColor = TFT_MAGENTA; label = "Magnet Range"; desc = "Pulls in XP gems from afar"; }
+    else if(upgType == 10) { boxColor = TFT_WHITE; label = "Knife Spin"; desc = "Spinning blade defense circle"; textColor = TFT_NAVY; }
+    else if(upgType == 11) { boxColor = TFT_YELLOW; label = "Pineapple Rings"; desc = "Fires explosive rings around you"; textColor = TFT_BLACK; }
+    else if(upgType == 12) { boxColor = TFT_LIGHTGREY; label = "Onion Shurikens"; desc = "Rapid directional shurikens"; textColor = TFT_BLACK; }
+    else if(upgType == 13) { boxColor = TFT_RED; label = "Jalapeno Bursts"; desc = "Fast fiery high-speed shots"; }
+    else if(upgType == 14) { boxColor = TFT_DARKGREY; label = "Truffle Spores"; desc = "Drops heavy damaging spores"; }
+    else if(upgType == 15) { boxColor = TFT_CYAN; label = "Anchovy Darts"; desc = "Homing fish dart projectiles"; textColor = TFT_BLACK; }
+    else if(upgType == 16) { boxColor = TFT_YELLOW; label = "Honey Drizzle"; desc = "Leaves slowing gold fields"; textColor = TFT_BLACK; }
+    else if(upgType == 17) { boxColor = TFT_BROWN; label = "Potato Cannon"; desc = "Fires area blast potatoes"; }
+    else if(upgType == 18) { boxColor = TFT_RED; label = "Hot Sauce Dropper"; desc = "Splashes high damage pools"; }
+    else if(upgType == 19) { boxColor = TFT_WHITE; label = "Marshmallow Shield"; desc = "Reduces incoming contact damage"; textColor = TFT_NAVY; }
+
+    canvas.fillRoundRect(15, boxY, 290, 56, 6, boxColor);
+    
+    // High-contrast outer outline for light-colored background buttons
+    if (upgType == 10 || upgType == 11 || upgType == 12 || upgType == 15 || upgType == 16 || upgType == 19) {
+      canvas.drawRoundRect(14, boxY - 1, 292, 58, 7, TFT_NAVY);
+    } else {
+      canvas.drawRoundRect(14, boxY - 1, 292, 58, 7, TFT_WHITE);
+    }
+
+    canvas.setTextColor(textColor, boxColor);
+    canvas.setCursor(25, boxY + 8);
+    canvas.print(String(i + 1) + ". " + label);
+    canvas.setCursor(25, boxY + 28);
+    canvas.print(desc);
+  }
+
+  canvas.pushSprite(0, 0);
+
+  if (touchPressed && !lastTouchState) {
+    int chosenIndex = -1;
+    if (touchY >= 48 && touchY <= 104) chosenIndex = 0;
+    else if (touchY >= 110 && touchY <= 166) chosenIndex = 1;
+    else if (touchY >= 172 && touchY <= 228) chosenIndex = 2;
+
+    if (chosenIndex != -1) {
+      int appliedUpg = currentRandomUpgrades[chosenIndex];
+      if (appliedUpg == 0) upgPepperoni++;
+      else if (appliedUpg == 1) upgMushroom++;
+      else if (appliedUpg == 2) upgOlive++;
+      else if (appliedUpg == 3) upgBacon++;
+      else if (appliedUpg == 4) upgGarlic++;
+      else if (appliedUpg == 5) {
+        upgCheese++;
+        pizzaMaxHP += 50;
+        pizzaHP = pizzaMaxHP;
+      }
+      else if (appliedUpg == 6) upgCrust++;
+      else if (appliedUpg == 7) upgSausage++;
+      else if (appliedUpg == 8) upgBasil++;
+      else if (appliedUpg == 9) upgMagnet = min(3, upgMagnet + 1);
+      else if (appliedUpg == 10) upgKnifeSpin++;
+      else if (appliedUpg == 11) upgPineapple++;
+      else if (appliedUpg == 12) upgOnion++;
+      else if (appliedUpg == 13) upgJalapeno++;
+      else if (appliedUpg == 14) upgTruffle++;
+      else if (appliedUpg == 15) upgAnchovy++;
+      else if (appliedUpg == 16) upgHoney++;
+      else if (appliedUpg == 17) upgPotato++;
+      else if (appliedUpg == 18) upgHotSauce++;
+      else if (appliedUpg == 19) upgMarshmallow++;
+
+      pizzaLevel++;
+      nextLevelXP += 50 + (pizzaLevel * 18);
+      pizzaWave++;
+      lastTouchState = true;
+      currentGameState = PIZZA_HERO;
+      playTone(880, 100);
+      delay(300);
+    }
+  }
+}
+
+void runPizzaGameOver() {
+  canvas.fillScreen(TFT_BLACK);
+  canvas.setTextSize(2);
+  canvas.setTextColor(TFT_RED, TFT_BLACK);
+  canvas.setCursor(80, 40); canvas.print("PIZZA BURNED");
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  canvas.setCursor(90, 90); canvas.print("Final Score: "); canvas.print(pizzaXP);
+  canvas.setCursor(90, 115); canvas.print("High Score:  "); canvas.print(highScorePizza);
+
+  canvas.fillRoundRect(80, 155, 160, 40, 6, TFT_MAROON);
+  canvas.setTextColor(TFT_WHITE, TFT_MAROON);
+  canvas.setCursor(120, 168); canvas.print("MAIN MENU");
+
+  canvas.pushSprite(0, 0);
+
+  if (touchPressed && !lastTouchState) {
+    if (touchX >= 80 && touchX <= 240 && touchY >= 155 && touchY <= 195) {
+      currentGameState = MENU;
+      delay(300);
+    }
+  }
+}
+
+// ==========================================
+// 4. SETTINGS & MAIN MENU
+// ==========================================
+void runSettings() {
+  canvas.fillScreen(TFT_BLACK);
+  canvas.setTextSize(2);
+  canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  canvas.setCursor(100, 20); canvas.print("SETTINGS");
+
+  canvas.setTextSize(1);
+  canvas.setCursor(90, 75); canvas.print("VOLUME: "); canvas.print(soundVolume);
+  
+  canvas.fillRoundRect(50, 93, 40, 30, 4, TFT_DARKGREY);
+  canvas.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  canvas.setCursor(65, 103); canvas.print("-");
+  
+  for(int i=0; i<=10; i++) {
+    uint16_t col = (i <= soundVolume) ? TFT_GREEN : TFT_DARKGREY;
+    canvas.fillRect(100 + (i * 12), 98, 10, 20, col);
+  }
+
+  canvas.fillRoundRect(230, 93, 40, 30, 4, TFT_DARKGREY);
+  canvas.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  canvas.setCursor(245, 103); canvas.print("+");
+
+  canvas.fillRoundRect(60, 140, 200, 40, 6, TFT_RED);
+  canvas.setTextColor(TFT_WHITE, TFT_RED);
+  canvas.setCursor(95, 153); canvas.print("RESET HIGHSCORES");
+
+  canvas.fillRoundRect(110, 195, 100, 35, 6, TFT_DARKGREY);
+  canvas.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  canvas.setCursor(145, 206); canvas.print("BACK");
+
+  canvas.pushSprite(0, 0);
+
+  if (touchPressed && !lastTouchState) {
+    if (touchX >= 60 && touchX <= 260 && touchY >= 140 && touchY <= 180) {
+      resetHighScores();
+      canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+      canvas.setCursor(110, 225); canvas.print("Settings Reset!");
+      canvas.pushSprite(0, 0);
+      delay(1000);
+    } else if (touchX >= 110 && touchX <= 210 && touchY >= 195 && touchY <= 230) {
+      currentGameState = MENU;
+      delay(300);
+    }
+    if (touchY >= 93 && touchY <= 123) {
+      if (touchX >= 50 && touchX <= 90) {
+        soundVolume = max(0, soundVolume - 1);
+        saveVolumeSetting();
+        playTone(500, 50);
+        delay(150);
+      } else if (touchX >= 230 && touchX <= 270) {
+        soundVolume = min(10, soundVolume + 1);
+        saveVolumeSetting();
+        playTone(700, 50);
+        delay(150);
+      }
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUZZER_PIN, OUTPUT);
+  SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, -1);
+  tft.init();
+  tft.setRotation(5);
+  touch.begin();
+  touch.setRotation(1);
+  canvas.createSprite(320, 240);
+  randomSeed(analogRead(1));
+  loadPreferences();
+}
+
+void loop() {
+  updateTouch();
+
+  if (!touchPressed) {
+    lastTouchState = false;
+  }
+
+  if (currentGameState == MENU) {
+    canvas.fillScreen(TFT_BLACK);
+    canvas.setTextSize(2);
+    canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+    canvas.setCursor(85, 15); canvas.print("ESP32 ARCADE");
+
+    canvas.fillRoundRect(35, 60, 115, 55, 6, TFT_NAVY);
+    canvas.setTextSize(1);
+    canvas.setTextColor(TFT_WHITE, TFT_NAVY);
+    canvas.setCursor(70, 80); canvas.print("WHACK");
+
+    canvas.fillRoundRect(170, 60, 115, 55, 6, TFT_MAROON);
+    canvas.setTextColor(TFT_WHITE, TFT_MAROON);
+    canvas.setCursor(195, 80); canvas.print("PIZZA HERO");
+
+    canvas.fillRoundRect(100, 135, 120, 45, 6, TFT_DARKGREY);
+    canvas.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    canvas.setCursor(132, 150); canvas.print("SETTINGS");
+
+    canvas.pushSprite(0, 0);
+
+    if (touchPressed && !lastTouchState) {
+      if (touchX >= 35 && touchX <= 150 && touchY >= 60 && touchY <= 115) { 
+        initWhack(); currentGameState = WHACK_MOLE; 
+      }
+      else if (touchX >= 170 && touchX <= 285 && touchY >= 60 && touchY <= 115) { 
+        initPizzaHero(); currentGameState = PIZZA_HERO; 
+      }
+      else if (touchX >= 100 && touchX <= 220 && touchY >= 135 && touchY <= 180) { 
+        currentGameState = SETTINGS; 
+      }
+      delay(300);
+    }
+  } 
+  else if (currentGameState == SETTINGS) {
+    runSettings();
+  }
+  else if (currentGameState == WHACK_MOLE) {
+    runWhack();
+    canvas.pushSprite(0, 0);
+  }
+  else if (currentGameState == WHACK_GAME_OVER) {
+    runWhackGameOver();
+  }
+  else if (currentGameState == PIZZA_HERO) {
+    runPizzaGame();
+    canvas.pushSprite(0, 0);
+  }
+  else if (currentGameState == PIZZA_PAUSE) {
+    runPizzaPause();
+  }
+  else if (currentGameState == PIZZA_UPGRADE_WARNING) {
+    runPizzaUpgradeWarning();
+  }
+  else if (currentGameState == PIZZA_UPGRADE) {
+    runPizzaUpgrade();
+  }
+  else if (currentGameState == PIZZA_GAME_OVER) {
+    runPizzaGameOver();
+  }
+  
+  delay(30);
+}
